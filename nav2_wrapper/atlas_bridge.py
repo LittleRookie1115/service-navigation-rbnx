@@ -737,12 +737,32 @@ def _spawn_velocity_guard(cfg: dict) -> None:
     ).start()
 
 
+def _send_full_costmap(params_file: str) -> str:
+    """The parameters with the global costmap publishing its whole grid every
+    time, as robonix/service/navigation/costmap promises. nav2 otherwise
+    sends the grid once and then only updates on costmap_updates, which a
+    subscriber to the contract's topic never sees."""
+    import yaml
+
+    params = yaml.safe_load(Path(params_file).read_text(encoding="utf-8")) or {}
+    ros = params.setdefault("global_costmap", {}).setdefault("global_costmap", {}).setdefault("ros__parameters", {})
+    if ros.get("always_send_full_costmap") is True:
+        return params_file
+    ros["always_send_full_costmap"] = True
+    target = _pkg_root / "rbnx-build" / "runtime" / f"nav2_params_full_costmap_{_cap_id}.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(params, sort_keys=False), encoding="utf-8")
+    log.info("global costmap sends its whole grid every time (%s)", target)
+    return str(target)
+
+
 def _spawn_nav2(cfg: dict, remap_args: list[str]) -> None:
     global _nav2_proc
     controller_velocity_output_topic = (
         resolve_controller_velocity_output_topic(cfg)
     )
     params_file, launch_remaps = _materialize_params(cfg, remap_args)
+    params_file = _send_full_costmap(params_file)
     monitor_params = _pin_collision_monitor(params_file)
     _spawn_velocity_guard(cfg)
     launch_file = _materialize_guarded_launch(
@@ -1302,6 +1322,8 @@ def init(cfg: dict):
             f"(Nav2 topic: {_speed_settings.topic})"
         )
 
+    _declare_costmap()
+
     with _state_lock:
         _initialized = True
     log.info(
@@ -1311,6 +1333,24 @@ def init(cfg: dict):
         _speed_percentage,
     )
     return Ok()
+
+
+# The global costmap nav2 plans on, which a consumer that places goals
+# (explore) reads lethal cells off to stay clear of obstacles the occupancy
+# grid lacks, such as table tops only a camera sees. TRANSIENT_LOCAL, in its
+# own frame (header.frame_id).
+_COSTMAP = ("robonix/service/navigation/costmap", "/global_costmap/costmap")
+
+
+def _declare_costmap() -> None:
+    """Declare the global costmap on atlas. Navigation works without it, so a
+    failure is logged, not raised."""
+    contract_id, topic = _COSTMAP
+    try:
+        nav.declare_ros2_topic(contract_id, topic, qos="transient_local")
+        log.info("declared %s -> ROS2 topic %s", contract_id, topic)
+    except Exception as e:  # noqa: BLE001
+        log.warning("declare %s failed: %s", contract_id, e)
 
 
 @nav.on_shutdown
