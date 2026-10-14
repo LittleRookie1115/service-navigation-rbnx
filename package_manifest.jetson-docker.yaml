@@ -28,3 +28,4 @@ capabilities:
   - name: robonix/service/navigation/adjust_speed
   - name: robonix/service/navigation/set_speed_limit
   - name: robonix/service/navigation/get_speed_limit
+  - name: robonix/service/navigation/costmap
