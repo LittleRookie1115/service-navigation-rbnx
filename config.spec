@@ -130,7 +130,6 @@ properties:
         description: Clouds published per second at most.
       source_timeout_s:
         type: number
-        exclusiveMinimum: 0
         default: 1.0
         description: >-
           Finite positive depth-cloud timeout in monotonic seconds. When
