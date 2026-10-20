@@ -73,15 +73,18 @@ a PointCloud2 in the camera frame on that topic. Costmap layers such as
 obstacles for the robot, from just above the floor to the top of its body.
 Without the token the camera is not used.
 
-When depth is enabled, the final velocity guard requires samples with strictly
-increasing, positive source timestamps. Missing samples or no newer sample
-within `source_timeout_s` latch zero velocity and request cancellation of the
-current `NavigateToPose` UUID. The timeout must be finite and positive; it uses
+Depth projection and Collision Monitor integration are upstream features.
+The added freshness watchdog in the final velocity guard requires samples
+with strictly increasing, positive source timestamps when depth is enabled.
+Missing samples or no newer sample within `source_timeout_s` latch zero
+velocity and request cancellation of the current `NavigateToPose` UUID.
+The timeout must be finite and positive; it uses
 monotonic elapsed time, not simulation time. Both incoming commands and the
 50 ms timer check it, so stopping does not depend on another velocity command.
-The timer retries cancellation when the service is unavailable. Depth recovery
-does not release the same goal, even after its terminal status; a new goal and
-fresh samples are required. Timestamps are retained across goals, so replayed
+The timer retries cancellation when the service is unavailable or the request
+raises an exception. Depth recovery does not release the same goal, even
+after its terminal status; a new goal and fresh samples are required.
+Timestamps are retained across goals, so replayed
 or out-of-order samples cannot refresh the watchdog. Restart the navigation
 provider after resetting the source clock.
 
@@ -141,20 +144,6 @@ At `Driver(CMD_INIT)`, the wrapper:
 
 Missing required providers return `deferred`. Invalid config or a Nav2 startup
 failure returns `error` and tears down every child process.
-
-Before sending each `NavigateToPose` goal, the wrapper asynchronously checks
-the same target through Nav2's internal `ComputePathToPose` action using the
-current robot pose and global costmap. An unavailable planner, rejected or
-failed plan, empty path, or five-second wall-clock timeout returns `FAILED`
-through the existing navigation status, without sending a motion goal.
-Canceling during this check cancels the planning action for that run; late
-results cannot start navigation. Explicit target orientation is preserved,
-including an identity quaternion meaning zero yaw.
-
-This check adds no public capability and does not replace controller collision
-checks, the depth watchdog, or physical stop verification. Planner tolerances
-and obstacle sources remain deployment-owned: a planner allowed to snap to a
-nearby pose can still accept a target whose exact position is blocked.
 
 ## Build and tests
 
