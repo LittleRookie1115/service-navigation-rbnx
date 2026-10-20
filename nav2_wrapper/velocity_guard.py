@@ -89,6 +89,7 @@ class VelocityGuardNode(Node):
         self._depth_timeout_s = depth_timeout_s
         self._depth_stamp = None
         self._depth_received_at = None
+        self._depth_fault_latched = False
         self._trace = None
         self._trace_dir = Path(os.getenv("ROBONIX_NAV_TRACE_DIR", "/tmp/robonix-nav-traces"))
         self._trace_dir.mkdir(parents=True, exist_ok=True)
@@ -175,6 +176,7 @@ class VelocityGuardNode(Node):
         self._active_uuid = goal_uuid
         self._active_uuid_raw = normalize_uuid_octets(raw_uuid)
         self._cancel_sent = False
+        self._depth_fault_latched = False
         self._robot_pose = None
         self._goal_pose = None
         self.guard.begin_goal(goal_uuid)
@@ -199,7 +201,7 @@ class VelocityGuardNode(Node):
             )
             if not active and self._active_uuid:
                 self._event("goal_inactive")
-                if not (self._depth_topic and self.guard.latched_reason):
+                if not self._depth_fault_latched:
                     self.guard.clear_if_idle()
 
     def _on_feedback(self, msg) -> None:
@@ -307,6 +309,7 @@ class VelocityGuardNode(Node):
             else:
                 return ""
             self.guard.latched_reason = reason
+            self._depth_fault_latched = True
             self.get_logger().error(f"DEPTH GUARD TRIPPED uuid={self._active_uuid}: {reason}")
             self._event("depth_timeout", reason=reason)
         return self.guard.latched_reason
@@ -378,7 +381,7 @@ class VelocityGuardNode(Node):
             self._check_depth()
             if self.guard.latched_reason:
                 self._pub.publish(Twist())
-                if self._depth_topic:
+                if self._depth_fault_latched:
                     self._trip(self.guard.latched_reason)
 
 

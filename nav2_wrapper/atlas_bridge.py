@@ -141,18 +141,14 @@ _initialized = False
 # ROS2 client state (initialized inside Driver.Init after nav2 is alive)
 _ros_node = None
 _nav_action_client = None
-_path_action_client = None
 _nav_action_ready = False
 _NavigateToPose = None
-_ComputePathToPose = None
 _PoseStamped = None
 _GoalStatus = None
 _SpeedLimit = None
 _nav_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
 _goal_states: dict[str, dict] = {}
 _goal_handles: dict[str, object] = {}
-_path_checks: dict[str, dict] = {}
-_PATH_CHECK_TIMEOUT_S = 5.0
 _nav_diagnostics: deque[str] = deque(maxlen=12)
 # (data, width, height, resolution) of the latest local costmap grid.
 _local_costmap_snapshot: "tuple[list[int], int, int, float] | None" = None
@@ -176,9 +172,9 @@ _USE_SIM_TIME = False
 
 
 def _import_ros2() -> None:
-    global _NavigateToPose, _ComputePathToPose, _PoseStamped, _GoalStatus, _SpeedLimit
+    global _NavigateToPose, _PoseStamped, _GoalStatus, _SpeedLimit
     from geometry_msgs.msg import PoseStamped as RosPoseStamped  # type: ignore
-    from nav2_msgs.action import ComputePathToPose, NavigateToPose  # type: ignore
+    from nav2_msgs.action import NavigateToPose  # type: ignore
     from nav2_msgs.msg import SpeedLimit  # type: ignore
     try:
         from action_msgs.msg import GoalStatus  # type: ignore
@@ -187,7 +183,6 @@ def _import_ros2() -> None:
         _GoalStatus = None
     _PoseStamped = RosPoseStamped
     _NavigateToPose = NavigateToPose
-    _ComputePathToPose = ComputePathToPose
     _SpeedLimit = SpeedLimit
 
 
@@ -901,7 +896,7 @@ def _refresh_speed_subscriber() -> None:
 def _start_ros2_thread() -> None:
     """Spin a rclpy node + ActionClient. Re-entrant: only acts once."""
     def _run():
-        global _ros_node, _nav_action_client, _nav_action_ready, _path_action_client
+        global _ros_node, _nav_action_client, _nav_action_ready
         global _speed_publisher, _guard_speed_publisher
         import rclpy  # type: ignore
         from rclpy.executors import MultiThreadedExecutor  # type: ignore
@@ -924,7 +919,6 @@ def _start_ros2_thread() -> None:
         if settings is None:
             raise RuntimeError("dynamic speed settings are not initialized")
         _nav_action_client = ActionClient(node, _NavigateToPose, "navigate_to_pose")
-        _path_action_client = ActionClient(node, _ComputePathToPose, "compute_path_to_pose")
         # Latest local costmap snapshot for failure diagnostics. The rolling
         # window is robot-centred, so its centre stands in for the pose.
         from nav_msgs.msg import OccupancyGrid as _OccupancyGrid
@@ -955,7 +949,6 @@ def _start_ros2_thread() -> None:
         )
         while rclpy.ok():
             executor.spin_once(timeout_sec=0.05)
-            _expire_path_checks()
             # Drain goals queued by Navigate gRPC handler.
             while True:
                 try:
@@ -1148,6 +1141,7 @@ def _cancel_response_cb(fut, gid: str) -> None:
         state = _goal_states.get(gid)
         if state is not None and state.get("state") == "RUNNING":
             state["detail"] = detail
+            state["cancel_requested"] = accepted
 
 
 def _issue_cancel(goal_handle, gid: str) -> tuple[bool, str]:
@@ -1157,8 +1151,9 @@ def _issue_cancel(goal_handle, gid: str) -> tuple[bool, str]:
     except Exception as error:  # noqa: BLE001
         with _state_lock:
             state = _goal_states.get(gid)
-            if state is not None and state.get("state") == "RUNNING":
+            if state is not None:
                 state["detail"] = f"cancel request failed; goal may remain active: {error}"
+                state["cancel_requested"] = False
         return False, f"cancel failed: {error}"
     return True, "cancel requested"
 
@@ -1206,127 +1201,18 @@ def _result_cb(fut, gid: str):
     _restore_speed_after_run(gid)
 
 
-def _finish_path_check(gid: str, detail: str):
-    with _state_lock:
-        if _path_checks.pop(gid, None) is None:
-            return None
-        handle = _goal_handles.pop(gid, None)
-        state = _goal_states[gid]
-        canceled = bool(state.get("cancel_requested"))
-        _goal_states[gid] = {
-            "state": "CANCELED" if canceled else "FAILED",
-            "detail": (
-                f"canceled during path precheck; {detail}"
-                if canceled else detail
-            ) + "; no navigation goal sent",
-        }
-    _restore_speed_after_run(gid)
-    return handle
-
-
-def _expire_path_checks() -> None:
-    now = time.monotonic()
-    with _state_lock:
-        expired = [
-            gid for gid, check in _path_checks.items()
-            if now >= check["deadline"]
-        ]
-    for gid in expired:
-        handle = _finish_path_check(
-            gid, f"path precheck timed out after {_PATH_CHECK_TIMEOUT_S:.1f}s"
-        )
-        if handle is not None:
-            _issue_cancel(handle, gid)
-
-
-def _path_response_cb(future, gid: str) -> None:
-    try:
-        handle = future.result()
-        if not handle.accepted:
-            _finish_path_check(gid, "path precheck rejected by Nav2")
-            return
-        with _state_lock:
-            check = _path_checks.get(gid)
-            if check is not None:
-                _goal_handles[gid] = handle
-            cancel_requested = (
-                check is None
-                or bool(_goal_states[gid].get("cancel_requested"))
-                or time.monotonic() >= check["deadline"]
-            )
-        if check is None:
-            _issue_cancel(handle, gid)
-            return
-        result = handle.get_result_async()
-        result.add_done_callback(lambda completed: _path_result_cb(completed, gid))
-        if cancel_requested:
-            _issue_cancel(handle, gid)
-    except Exception as error:  # noqa: BLE001
-        handle = _finish_path_check(gid, f"path precheck request failed: {error}")
-        if handle is not None:
-            _issue_cancel(handle, gid)
-
-
-def _path_result_cb(future, gid: str) -> None:
-    try:
-        result = future.result()
-        status = _goal_status_name(result.status)
-        poses = getattr(getattr(result.result, "path", None), "poses", [])
-    except Exception as error:  # noqa: BLE001
-        _finish_path_check(gid, f"path precheck result failed: {error}")
-        return
-    with _state_lock:
-        check = _path_checks.get(gid)
-        if check is None:
-            return
-        if time.monotonic() >= check["deadline"]:
-            detail = f"path precheck timed out after {_PATH_CHECK_TIMEOUT_S:.1f}s"
-        elif _goal_states[gid].get("cancel_requested"):
-            detail = f"planner returned {status.lower()}"
-        elif status != "SUCCEEDED":
-            detail = f"path precheck failed: {status.lower()}"
-        elif not poses:
-            detail = "path precheck returned an empty path"
-        else:
-            _path_checks.pop(gid)
-            _goal_handles.pop(gid, None)
-            _goal_states[gid] = {"state": "PENDING", "detail": "path precheck passed"}
-            _nav_queue.put((gid, {**check["payload"], "path_checked": True}))
-            return
-    _finish_path_check(gid, detail)
-
-
 def _dispatch_goal(node, gid: str, payload: dict):
     with _state_lock:
         current = _goal_states.get(gid)
-        if current is None or current.get("state") != "PENDING":
+        if current is None:
+            return
+        if current.get("state") == "CANCELED" and current.get("cancel_requested"):
             return
         # Claim the queue entry while holding the same lock used by cancel.
         # A cancel racing after this point is latched and forwarded as soon as
         # Nav2 returns the goal handle; it must not look terminal prematurely.
         current["state"] = "RUNNING"
-        path_checked = bool(payload.get("path_checked"))
-        current["detail"] = "dispatching goal" if path_checked else "checking path with Nav2"
-        if not path_checked:
-            _path_checks[gid] = {
-                "payload": payload,
-                "deadline": time.monotonic() + _PATH_CHECK_TIMEOUT_S,
-            }
-    if not path_checked:
-        try:
-            if _path_action_client is None or not _path_action_client.server_is_ready():
-                _finish_path_check(gid, "compute_path_to_pose action server not ready")
-                return
-            goal_msg = _ComputePathToPose.Goal()
-            goal_msg.goal = _make_pose(
-                node, payload["frame_id"], payload["x"], payload["y"], payload["yaw"]
-            )
-            goal_msg.use_start = False
-            future = _path_action_client.send_goal_async(goal_msg)
-            future.add_done_callback(lambda completed: _path_response_cb(completed, gid))
-        except Exception as error:  # noqa: BLE001
-            _finish_path_check(gid, f"path precheck request failed: {error}")
-        return
+        current["detail"] = "dispatching goal"
     pose = _make_pose(node, payload["frame_id"], payload["x"], payload["y"], payload["yaw"])
     goal_msg = _NavigateToPose.Goal()
     goal_msg.pose = pose

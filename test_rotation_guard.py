@@ -198,6 +198,17 @@ class VelocityGuardDepthTest(unittest.TestCase):
         self.assertEqual(node._pub.publish.call_args.args[0].linear.x, 0.2)
         self.assertFalse(node._cancel_sent)
 
+    def test_fresh_depth_preserves_upstream_rotation_idle_recovery(self):
+        node = self._node()
+        self._depth(node)
+        self._goal(node)
+        node.guard.latched_reason = "terminal rotation timeout"
+        node._on_status(SimpleNamespace(status_list=[]))
+        self.assertEqual(node.guard.latched_reason, "")
+        self._command(node)
+        self.assertEqual(node._pub.publish.call_args.args[0].linear.x, 0.2)
+        node._cancel.call_async.assert_not_called()
+
     def test_new_goal_cannot_refresh_old_data(self):
         node = self._node()
         self._depth(node, 2)
