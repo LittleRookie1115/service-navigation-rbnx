@@ -142,6 +142,20 @@ At `Driver(CMD_INIT)`, the wrapper:
 Missing required providers return `deferred`. Invalid config or a Nav2 startup
 failure returns `error` and tears down every child process.
 
+Before sending each `NavigateToPose` goal, the wrapper asynchronously checks
+the same target through Nav2's internal `ComputePathToPose` action using the
+current robot pose and global costmap. An unavailable planner, rejected or
+failed plan, empty path, or five-second wall-clock timeout returns `FAILED`
+through the existing navigation status, without sending a motion goal.
+Canceling during this check cancels the planning action for that run; late
+results cannot start navigation. Explicit target orientation is preserved,
+including an identity quaternion meaning zero yaw.
+
+This check adds no public capability and does not replace controller collision
+checks, the depth watchdog, or physical stop verification. Planner tolerances
+and obstacle sources remain deployment-owned: a planner allowed to snap to a
+nearby pose can still accept a target whose exact position is blocked.
+
 ## Build and tests
 
 Navigation generates only its Atlas MCP bindings on every deployment target.
