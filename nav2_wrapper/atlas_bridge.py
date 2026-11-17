@@ -1647,8 +1647,6 @@ class _GetSpeedLimitServicer(
 def navigate(req: McpNavigateRequest) -> McpNavigateResponse:
     """Start a Nav2 NavigateToPose run. Returns a run_id for status/cancel."""
     out = _navigate_impl(req.goal)
-    if not out["accepted"]:
-        raise RuntimeError(out["detail"])
     return McpNavigateResponse(**out)
 
 
@@ -1656,8 +1654,6 @@ def navigate(req: McpNavigateRequest) -> McpNavigateResponse:
 def status(req: McpStatusRequest) -> McpStatusResponse:
     """Poll a navigation run. Empty run_id means the most recent run."""
     out = _status_impl(req.run_id)
-    if not out["known"]:
-        raise RuntimeError(out["detail"])
     return McpStatusResponse(**out)
 
 
@@ -1665,8 +1661,6 @@ def status(req: McpStatusRequest) -> McpStatusResponse:
 def cancel(req: McpCancelRequest) -> McpCancelResponse:
     """Cancel a navigation run. Empty run_id means the most recent active run."""
     out = _cancel_impl(req.run_id)
-    if not out["accepted"]:
-        raise RuntimeError(out["detail"])
     return McpCancelResponse(**out)
 
 

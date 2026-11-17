@@ -74,19 +74,52 @@ obstacles for the robot, from just above the floor to the top of its body.
 Without the token the camera is not used.
 
 Depth projection and Collision Monitor integration are upstream features.
-The added freshness watchdog in the final velocity guard requires samples
-with strictly increasing, positive source timestamps when depth is enabled.
-Missing samples or no newer sample within `source_timeout_s` latch zero
-velocity and request cancellation of the current `NavigateToPose` UUID.
-The timeout must be finite and positive; it uses
-monotonic elapsed time, not simulation time. Both incoming commands and the
-50 ms timer check it, so stopping does not depend on another velocity command.
-The timer retries cancellation when the service is unavailable or the request
-raises an exception. Depth recovery does not release the same goal, even
-after its terminal status; a new goal and fresh samples are required.
-Timestamps are retained across goals, so replayed
-or out-of-order samples cannot refresh the watchdog. Restart the navigation
-provider after resetting the source clock.
+The final velocity guard checks depth freshness and publishes chassis commands
+only while it owns an active `NavigateToPose` UUID reported by action status.
+Startup and idle depth gaps produce no chassis writes; idle commands and
+feedback are ignored. The action status subscription uses the transient-local
+action preset, so a late-joining guard receives the retained live or terminal
+snapshot. A current UUID keeps ownership while the latest status still reports
+it as nonterminal, even if a pending goal is also marked EXECUTING. Terminal,
+empty, or owner-missing status retires it. Nonempty snapshots whose newest
+acceptance predates the current owner's acceptance are ignored before changing
+ownership or history. Initial snapshots with multiple live
+UUIDs leave the guard silent until a unique eligible live goal is reported;
+feedback cannot choose an owner.
+
+Positive `goal_info.stamp` acceptance timestamps bound retirement history.
+The guard remembers at most 128 retired UUIDs at the newest acceptance stamp;
+older unknown UUIDs cannot acquire ownership. It also carries at most 16
+eligible live candidates across newer stamps, so a newer failed pending goal
+does not exclude an older still-live goal, including in a retained snapshot.
+A disappeared or terminal candidate loses that eligibility. Equal-stamp goals
+are allowed until retirement or candidate capacity overflows; overflow blocks
+new acquisition until a newer acceptance stamp supplies an eligible goal.
+An already-owned UUID still reported live keeps ownership. Zero or negative
+acceptance stamps cannot acquire control. After resetting the action server's
+source clock, restart the navigation provider to reset this acceptance fence.
+Evicted retirement history cannot be revived by old status or feedback.
+
+When depth is enabled, the watchdog requires samples with strictly increasing,
+positive source timestamps. Missing samples or no newer sample within
+`source_timeout_s` latch the active goal and request cancellation of that exact
+UUID. The timeout must be finite and positive; it uses monotonic elapsed time,
+not simulation time. Both incoming commands and the 50 ms timer check it, so
+stopping does not depend on another velocity command. A depth or rotation
+fault sends at most three zero frames, starting immediately, then stops all
+chassis publication, including on incoming commands. Cancellation can retry
+after the burst if the service is unavailable, sending fails, or the reply
+rejects that UUID, with a 0.5-second retry interval and no further chassis
+writes. Only one cancellation request can be pending; after two seconds
+without a reply it is removed from the client before another attempt.
+Retirement also removes any pending request and stops both the burst and
+retries. A late completion cannot affect a new owner. This guard does not
+acquire an idle chassis lock or interfere with another driver's idle commands.
+
+Depth recovery does not release the faulted goal; a new UUID and fresh samples
+are required. Timestamps are retained across goals, so replayed or out-of-order
+samples cannot refresh the watchdog. Restart the navigation provider after
+resetting the source clock.
 
 This watchdog detects stream freshness, not obstacles inside the camera's
 minimum range or invalid geometry in an otherwise updating stream. It does not
@@ -165,6 +198,33 @@ python3 -m unittest -v \
   test_velocity_limit.py
 ```
 
+The MCP envelope cases in `test_runtime_integration.py` require FastMCP, the
+Robonix Python API, and generated Navigation bindings. They skip when those
+dependencies are unavailable. After building the package, include the API
+source in the test environment:
+
+```bash
+PYTHONPATH="$(rbnx path robonix-api)${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m unittest -v test_runtime_integration.NavigationMcpEnvelopeTest
+```
+
 Jetson native builds require ROS 2 Humble and Nav2 packages compatible with the
 host JetPack image. Docker manifests remain available for simulator and CI
 deployments.
+
+## Protocol responses
+
+The `navigate`, `navigate/status`, and `navigate/cancel` capabilities return the
+same typed response fields over gRPC and MCP. Business rejections are completed
+MCP tool calls (`isError=false`) with a negative contract response:
+
+- `navigate` before ROS 2 initialization returns `accepted=false`, an empty
+  `run_id`, and a diagnostic `detail`.
+- `navigate/status` for an unknown run returns `known=false`, `state="FAILED"`,
+  and `detail="unknown run_id"`. Check `known` before interpreting `state`.
+- `navigate/cancel` for an unknown or already terminal run returns
+  `accepted=false` and a diagnostic `detail`.
+
+Unexpected exceptions and transport failures remain errors. Clients must inspect
+`accepted` or `known` after a completed call to distinguish a contract rejection
+from an accepted request or known run.

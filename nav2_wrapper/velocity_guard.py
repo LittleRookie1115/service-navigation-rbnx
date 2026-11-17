@@ -20,12 +20,19 @@ from nav_msgs.msg import Odometry, Path as NavPath
 from sensor_msgs.msg import LaserScan, PointCloud2
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_action_status_default, qos_profile_sensor_data
 
 from nav2_wrapper.cmd_vel_summary import CmdVelSummary
 from nav2_wrapper.configuration import resolve_velocity_output_topic, validate_absolute_ros_topic
 from nav2_wrapper.rotation_guard_core import GuardLimits, RotationGuard, normalize_uuid_octets
 from nav2_wrapper.velocity_limit import bounded_linear_velocity
+
+
+_STOP_FRAME_LIMIT = 3
+_RETIRED_UUID_LIMIT = 128
+_LIVE_CANDIDATE_LIMIT = 16
+_CANCEL_RETRY_S = 0.5
+_CANCEL_REPLY_TIMEOUT_S = 2.0
 
 
 def _yaw(q) -> float:
@@ -80,16 +87,24 @@ class VelocityGuardNode(Node):
         self._lock = threading.Lock()
         self._active_uuid = ""
         self._active_uuid_raw = None
+        self._active_stamp = 0
+        self._acceptance_fence = 0
+        self._retired_uuids = set()
+        self._live_candidates = {}
+        self._fence_closed = False
         self._robot_pose = None
         self._goal_pose = None
         self._last_cmd = (0.0, 0.0)
         self._cmd_summary = CmdVelSummary()
         self._cancel_sent = False
+        self._cancel_future = None
+        self._cancel_requested_at = None
+        self._cancel_retry_at = 0.0
+        self._stop_frames_remaining = None
         self._depth_topic = depth_topic
         self._depth_timeout_s = depth_timeout_s
         self._depth_stamp = None
         self._depth_received_at = None
-        self._depth_fault_latched = False
         self._trace = None
         self._trace_dir = Path(os.getenv("ROBONIX_NAV_TRACE_DIR", "/tmp/robonix-nav-traces"))
         self._trace_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +130,8 @@ class VelocityGuardNode(Node):
                 PointCloud2, depth_topic, self._on_depth, qos_profile_sensor_data
             )
         self.create_subscription(
-            GoalStatusArray, "/navigate_to_pose/_action/status", self._on_status, 10
+            GoalStatusArray, "/navigate_to_pose/_action/status", self._on_status,
+            qos_profile_action_status_default,
         )
         self.create_subscription(
             NavigateToPose.Impl.FeedbackMessage,
@@ -167,48 +183,141 @@ class VelocityGuardNode(Node):
         self._trace.write(json.dumps(record, separators=(",", ":")) + "\n")
         self._trace.flush()
 
-    def _begin_goal(self, goal_uuid: str, raw_uuid) -> None:
-        if goal_uuid == self._active_uuid:
+    def _begin_goal(self, goal_uuid: str, raw_uuid, acceptance_stamp: int) -> None:
+        if (
+            self._active_uuid or acceptance_stamp <= 0
+            or self._live_candidates.get(goal_uuid) != acceptance_stamp
+            or self._fence_closed or goal_uuid in self._retired_uuids
+        ):
             return
-        if self._trace is not None:
-            self._event("trace_closed", reason="new_goal")
-            self._trace.close()
+        raw_uuid = normalize_uuid_octets(raw_uuid)
+        if not any(raw_uuid):
+            return
         self._active_uuid = goal_uuid
-        self._active_uuid_raw = normalize_uuid_octets(raw_uuid)
+        self._active_uuid_raw = raw_uuid
+        self._active_stamp = acceptance_stamp
         self._cancel_sent = False
-        self._depth_fault_latched = False
+        self._cancel_retry_at = 0.0
+        self._stop_frames_remaining = None
         self._robot_pose = None
         self._goal_pose = None
+        self._last_cmd = (0.0, 0.0)
         self.guard.begin_goal(goal_uuid)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         self._trace = (self._trace_dir / f"{stamp}-{goal_uuid}.jsonl").open("a", encoding="utf-8")
         self._event("goal_active", uuid=goal_uuid)
 
+    def _remember_retired(self, goal_uuid: str, acceptance_stamp: int) -> None:
+        if acceptance_stamp != self._acceptance_fence or goal_uuid in self._retired_uuids:
+            return
+        if len(self._retired_uuids) >= _RETIRED_UUID_LIMIT:
+            if not self._fence_closed:
+                self.get_logger().error("goal acceptance timestamp exhausted; waiting for a newer stamp")
+            self._fence_closed = True
+            self._live_candidates.clear()
+        else:
+            self._retired_uuids.add(goal_uuid)
+
+    def _clear_cancel_request(self) -> None:
+        future = self._cancel_future
+        self._cancel_future = None
+        self._cancel_requested_at = None
+        if future is not None:
+            self._cancel.remove_pending_request(future)
+
+    def _retire_goal(self, reason: str) -> None:
+        self._live_candidates.pop(self._active_uuid, None)
+        self._remember_retired(self._active_uuid, self._active_stamp)
+        self._event("goal_inactive", uuid=self._active_uuid, reason=reason)
+        if self._trace is not None:
+            self._event("trace_closed", reason=reason)
+            self._trace.close()
+            self._trace = None
+        self._active_uuid = ""
+        self._active_uuid_raw = None
+        self._active_stamp = 0
+        self._cancel_sent = False
+        self._clear_cancel_request()
+        self._cancel_retry_at = 0.0
+        self._stop_frames_remaining = None
+        self._robot_pose = None
+        self._goal_pose = None
+        self._last_cmd = (0.0, 0.0)
+        self.guard.clear_if_idle()
+
     def _on_status(self, msg: GoalStatusArray) -> None:
         with self._lock:
-            active = [
-                item for item in msg.status_list
-                if item.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING,
-                                   GoalStatus.STATUS_CANCELING)
-            ]
-            if active:
-                item = active[-1]
-                self._begin_goal(_uuid_text(item.goal_info.goal_id.uuid), item.goal_info.goal_id.uuid)
             self._event(
                 "status",
                 values=[{"uuid": _uuid_text(s.goal_info.goal_id.uuid), "status": int(s.status)}
                         for s in msg.status_list],
             )
-            if not active and self._active_uuid:
-                self._event("goal_inactive")
-                if not self._depth_fault_latched:
-                    self.guard.clear_if_idle()
+            live_states = (
+                GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING,
+                GoalStatus.STATUS_CANCELING,
+            )
+            terminal_states = (
+                GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED,
+                GoalStatus.STATUS_ABORTED,
+            )
+            entries = []
+            for item in msg.status_list:
+                stamp = item.goal_info.stamp.sec * 1_000_000_000 + item.goal_info.stamp.nanosec
+                if stamp > 0 and any(item.goal_info.goal_id.uuid):
+                    entries.append((_uuid_text(item.goal_info.goal_id.uuid), stamp, item))
+            newest_stamp = max((stamp for _, stamp, _ in entries), default=0)
+            if self._active_uuid and msg.status_list and newest_stamp < self._active_stamp:
+                return
+            terminal = {
+                uuid for uuid, stamp, item in entries if item.status in terminal_states
+            }
+            active = {
+                uuid: (stamp, item) for uuid, stamp, item in entries
+                if item.status in live_states and uuid not in terminal
+            }
+            eligible = {
+                uuid: stamp for uuid, (stamp, item) in active.items()
+                if self._live_candidates.get(uuid) == stamp
+                or stamp > self._acceptance_fence
+                or (
+                    stamp == self._acceptance_fence and not self._fence_closed
+                    and uuid not in self._retired_uuids
+                )
+            }
+            if newest_stamp > self._acceptance_fence:
+                self._acceptance_fence = newest_stamp
+                self._retired_uuids.clear()
+                self._fence_closed = False
+            for uuid, stamp in list(self._live_candidates.items()):
+                if uuid not in eligible:
+                    self._remember_retired(uuid, stamp)
+            for uuid, stamp, item in entries:
+                if item.status in terminal_states:
+                    self._remember_retired(uuid, stamp)
+            if len(eligible) > _LIVE_CANDIDATE_LIMIT:
+                if not self._fence_closed:
+                    self.get_logger().error("too many live goal candidates; waiting for a newer stamp")
+                self._fence_closed = True
+            self._live_candidates = {} if self._fence_closed else eligible
+            if self._active_uuid:
+                if self._active_uuid in terminal:
+                    self._retire_goal("terminal_status")
+                elif any(
+                    uuid == self._active_uuid and stamp == self._active_stamp
+                    and item.status in live_states for uuid, stamp, item in entries
+                ):
+                    return
+                else:
+                    self._retire_goal("missing_status" if msg.status_list else "empty_status")
+            if len(active) == 1:
+                uuid, (stamp, item) = next(iter(active.items()))
+                self._begin_goal(uuid, item.goal_info.goal_id.uuid, stamp)
 
     def _on_feedback(self, msg) -> None:
         with self._lock:
             uuid = _uuid_text(msg.goal_id.uuid)
-            if uuid and uuid != self._active_uuid:
-                self._begin_goal(uuid, msg.goal_id.uuid)
+            if not self._active_uuid or uuid != self._active_uuid:
+                return
             pose = msg.feedback.current_pose.pose
             self._robot_pose = (pose.position.x, pose.position.y, _yaw(pose.orientation))
             self._event(
@@ -221,6 +330,8 @@ class VelocityGuardNode(Node):
         if not msg.poses:
             return
         with self._lock:
+            if not self._active_uuid:
+                return
             pose = msg.poses[-1].pose
             self._goal_pose = (pose.position.x, pose.position.y, _yaw(pose.orientation))
             self._event("plan", frame=msg.header.frame_id, points=len(msg.poses), goal=self._goal_pose)
@@ -301,6 +412,8 @@ class VelocityGuardNode(Node):
                 self._depth_received_at = time.monotonic()
 
     def _check_depth(self) -> str:
+        if not self._active_uuid:
+            return ""
         if self._depth_topic and not self.guard.latched_reason:
             if self._depth_received_at is None:
                 reason = "depth input has not received a sample"
@@ -309,13 +422,14 @@ class VelocityGuardNode(Node):
             else:
                 return ""
             self.guard.latched_reason = reason
-            self._depth_fault_latched = True
             self.get_logger().error(f"DEPTH GUARD TRIPPED uuid={self._active_uuid}: {reason}")
             self._event("depth_timeout", reason=reason)
         return self.guard.latched_reason
 
     def _on_cmd(self, msg: Twist) -> None:
         with self._lock:
+            if not self._active_uuid or self.guard.latched_reason:
+                return
             x, y, limited = bounded_linear_velocity(
                 float(msg.linear.x),
                 float(msg.linear.y),
@@ -350,39 +464,76 @@ class VelocityGuardNode(Node):
             if line:
                 self.get_logger().info(line)
             if reason:
-                self._pub.publish(Twist())
                 self._trip(reason)
             else:
                 self._pub.publish(output)
 
     def _trip(self, reason: str) -> None:
-        if self._cancel_sent:
+        if not self._active_uuid:
             return
-        if (
-            self._active_uuid_raw is None
-            or not any(self._active_uuid_raw)
-            or not self._cancel.service_is_ready()
-        ):
+        if self._stop_frames_remaining is None:
+            self._stop_frames_remaining = _STOP_FRAME_LIMIT
+            self.get_logger().error(f"VELOCITY GUARD TRIPPED uuid={self._active_uuid}: {reason}")
+            self._event("guard_trip", reason=reason)
+        if self._stop_frames_remaining > 0:
+            self._pub.publish(Twist())
+            self._stop_frames_remaining -= 1
+        self._retry_cancel()
+
+    def _retry_cancel(self) -> None:
+        now = time.monotonic()
+        if self._cancel_future is not None and self._cancel_future.done():
+            future = self._cancel_future
+            self._clear_cancel_request()
+            try:
+                response = future.result()
+                self._cancel_sent = response.return_code == 0 and any(
+                    list(info.goal_id.uuid) == self._active_uuid_raw
+                    for info in response.goals_canceling
+                )
+                if not self._cancel_sent:
+                    raise RuntimeError(f"cancellation rejected (code={response.return_code})")
+                self._event("cancel_accepted", uuid=self._active_uuid)
+            except Exception as error:
+                self._cancel_sent = False
+                self._cancel_retry_at = now + _CANCEL_RETRY_S
+                self.get_logger().error(f"guard cancel failed uuid={self._active_uuid}: {error}")
+                self._event("cancel_failed", uuid=self._active_uuid, reason=str(error))
+        elif self._cancel_future is not None:
+            if (
+                not self._cancel_future.cancelled()
+                and now - self._cancel_requested_at < _CANCEL_REPLY_TIMEOUT_S
+            ):
+                return
+            self._clear_cancel_request()
+            self._cancel_sent = False
+            self._cancel_retry_at = now + _CANCEL_RETRY_S
+            self._event("cancel_timeout", uuid=self._active_uuid)
+        if self._cancel_sent or now < self._cancel_retry_at:
+            return
+        if self._active_uuid_raw is None or not any(self._active_uuid_raw):
+            return
+        self._cancel_retry_at = now + _CANCEL_RETRY_S
+        if not self._cancel.service_is_ready():
             return
         request = CancelGoal.Request()
         request.goal_info.goal_id.uuid = self._active_uuid_raw
         try:
-            self._cancel.call_async(request)
+            self._cancel_future = self._cancel.call_async(request)
         except Exception as error:
             self.get_logger().error(f"guard cancel failed uuid={self._active_uuid}: {error}")
             return
+        self._cancel_requested_at = now
         self._cancel_sent = True
-        self.get_logger().error(f"VELOCITY GUARD TRIPPED uuid={self._active_uuid}: {reason}")
-        self._event("guard_trip", reason=reason)
         self._event("cancel_requested", uuid=self._active_uuid)
 
     def _publish_latched_zero(self) -> None:
         with self._lock:
+            if not self._active_uuid:
+                return
             self._check_depth()
             if self.guard.latched_reason:
-                self._pub.publish(Twist())
-                if self._depth_fault_latched:
-                    self._trip(self.guard.latched_reason)
+                self._trip(self.guard.latched_reason)
 
 
 def main() -> None:

@@ -1,6 +1,8 @@
 import ast
+import json
 import math
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,181 @@ from nav2_wrapper.speed_control import speed_settings
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+class NavigationMcpEnvelopeTest(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from fastmcp import Client
+            from nav2_wrapper import atlas_bridge
+        except ModuleNotFoundError as error:
+            raise unittest.SkipTest(
+                f"navigation MCP runtime dependencies/codegen unavailable: {error}"
+            ) from error
+        cls.Client = Client
+        cls.bridge = atlas_bridge
+
+    def setUp(self):
+        state = patch.multiple(
+            self.bridge,
+            _ros_node=None,
+            _goal_states={},
+            _goal_handles={},
+            _last_run_id="",
+            _nav_queue=queue.Queue(),
+        )
+        state.start()
+        self.addCleanup(state.stop)
+
+    async def asyncSetUp(self):
+        self.client = self.Client(self.bridge.nav._mcp_app)
+        await self.client.__aenter__()
+        self.addAsyncCleanup(self.client.__aexit__, None, None, None)
+
+    async def _call_tool(self, name, arguments):
+        result = await self.client.call_tool_mcp(name, arguments)
+        self.assertFalse(result.isError, result.content)
+        return json.loads(result.content[0].text)
+
+    async def _assert_reply(self, name, arguments, expected, grpc_response):
+        self.assertEqual(
+            {
+                field.name: getattr(grpc_response, field.name)
+                for field in grpc_response.DESCRIPTOR.fields
+            },
+            expected,
+        )
+        handler = getattr(self.bridge, name)
+        reply = handler(handler._robonix_input_cls.from_dict(arguments))
+        self.assertIsInstance(reply, handler._robonix_output_cls)
+        self.assertEqual(reply.to_dict(), expected)
+        self.assertEqual(await self._call_tool(name, arguments), expected)
+
+    async def test_uninitialized_navigate_returns_typed_rejection(self):
+        expected = {
+            "accepted": False, "run_id": "", "detail": "ROS2 not initialized",
+        }
+        await self._assert_reply(
+            "navigate", {"goal": {}}, expected,
+            self.bridge._NavigateServicer().Navigate(
+                self.bridge.navigation_pb2.Navigate_Request(), None,
+            ),
+        )
+        self.assertTrue(self.bridge._nav_queue.empty())
+        self.assertEqual(self.bridge._goal_states, {})
+
+    async def test_missing_runs_return_typed_status_and_cancel_replies(self):
+        for run_id in ("missing-run", ""):
+            with self.subTest(run_id=run_id):
+                await self._assert_reply(
+                    "status", {"run_id": run_id},
+                    {"known": False, "state": "FAILED", "detail": "unknown run_id"},
+                    self.bridge._StatusServicer().GetNavigationStatus(
+                        self.bridge.navigation_pb2.GetNavigationStatus_Request(
+                            run_id=run_id,
+                        ), None,
+                    ),
+                )
+                await self._assert_reply(
+                    "cancel", {"run_id": run_id},
+                    {"accepted": False, "detail": "unknown run_id"},
+                    self.bridge._CancelServicer().CancelNavigation(
+                        self.bridge.navigation_pb2.CancelNavigation_Request(
+                            run_id=run_id,
+                        ), None,
+                    ),
+                )
+
+    async def test_terminal_runs_remain_known_and_reject_cancel(self):
+        self.bridge._last_run_id = "terminal-run"
+        for state in ("SUCCEEDED", "FAILED", "CANCELED"):
+            self.bridge._goal_states["terminal-run"] = {
+                "state": state, "detail": "terminal detail",
+            }
+            for run_id in ("terminal-run", ""):
+                with self.subTest(state=state, run_id=run_id):
+                    await self._assert_reply(
+                        "status", {"run_id": run_id},
+                        {"known": True, "state": state, "detail": "terminal detail"},
+                        self.bridge._StatusServicer().GetNavigationStatus(
+                            self.bridge.navigation_pb2.GetNavigationStatus_Request(
+                                run_id=run_id,
+                            ), None,
+                        ),
+                    )
+                    await self._assert_reply(
+                        "cancel", {"run_id": run_id},
+                        {"accepted": False, "detail": f"run is already {state.lower()}"},
+                        self.bridge._CancelServicer().CancelNavigation(
+                            self.bridge.navigation_pb2.CancelNavigation_Request(
+                                run_id=run_id,
+                            ), None,
+                        ),
+                    )
+
+    async def test_accepted_navigation_status_and_queued_cancel(self):
+        self.bridge._ros_node = object()
+        reply = await self._call_tool("navigate", {"goal": {
+            "header": {"frame_id": "map"},
+            "pose": {
+                "position": {"x": 1.5, "y": -2.0},
+                "orientation": {"w": 1.0},
+            },
+        }})
+        run_id = reply["run_id"]
+        self.assertTrue(run_id)
+        self.assertEqual(reply, {
+            "accepted": True, "run_id": run_id, "detail": "queued",
+        })
+        self.assertEqual(self.bridge._last_run_id, run_id)
+        self.assertEqual(self.bridge._nav_queue.get_nowait(), (run_id, {
+            "frame_id": "map", "x": 1.5, "y": -2.0, "yaw": 0.0,
+        }))
+        self.assertEqual(await self._call_tool("status", {"run_id": ""}), {
+            "known": True, "state": "PENDING", "detail": "queued",
+        })
+        self.assertEqual(await self._call_tool("cancel", {"run_id": ""}), {
+            "accepted": True, "detail": "canceled before dispatch",
+        })
+        self.assertTrue(self.bridge._goal_states[run_id]["cancel_requested"])
+        self.assertEqual(await self._call_tool("status", {"run_id": run_id}), {
+            "known": True, "state": "CANCELED", "detail": "canceled before dispatch",
+        })
+
+    async def test_running_cancel_still_reaches_the_action_handle(self):
+        goal_handle = Mock()
+        self.bridge._last_run_id = "active-run"
+        self.bridge._goal_states["active-run"] = {
+            "state": "RUNNING", "detail": "navigating",
+        }
+        self.bridge._goal_handles["active-run"] = goal_handle
+        self.assertEqual(await self._call_tool("cancel", {"run_id": ""}), {
+            "accepted": True, "detail": "cancel requested",
+        })
+        goal_handle.cancel_goal_async.assert_called_once_with()
+        goal_handle.cancel_goal_async.return_value.add_done_callback.assert_called_once()
+        self.assertTrue(self.bridge._goal_states["active-run"]["cancel_requested"])
+
+    async def test_unexpected_and_transport_exceptions_remain_mcp_errors(self):
+        for name, implementation, arguments in (
+            ("navigate", "_navigate_impl", {"goal": {}}),
+            ("status", "_status_impl", {"run_id": "run"}),
+            ("cancel", "_cancel_impl", {"run_id": "run"}),
+        ):
+            for error in (
+                RuntimeError("unexpected failure"),
+                self.bridge.grpc.RpcError("transport unavailable"),
+            ):
+                with self.subTest(tool=name, error=type(error).__name__):
+                    with patch.object(self.bridge, implementation, side_effect=error):
+                        handler = getattr(self.bridge, name)
+                        with self.assertRaises(type(error)) as raised:
+                            handler(handler._robonix_input_cls.from_dict(arguments))
+                        self.assertIs(raised.exception, error)
+                        result = await self.client.call_tool_mcp(name, arguments)
+                    self.assertTrue(result.isError)
+                    self.assertIn(str(error), result.content[0].text)
 
 
 class RuntimeIntegrationTest(unittest.TestCase):
